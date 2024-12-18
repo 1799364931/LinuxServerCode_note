@@ -1,6 +1,7 @@
 # Linux 网络编程 --- 1
 ## 写在前面
 本(系列)文章主要记录和分享笔者学习Linux网络编程的过程，对笔者认为较难理解的概念或代码进行二次阐释与理解。\
+由于本文是学习笔记，未免部分方面有所错误或疏漏，希望读者可以捉虫进行纰漏指正 \
 主要参考学习书籍 《Linux高性能服务器编程》--游双著 
 
 ## 在开始之前
@@ -294,4 +295,162 @@ I/O多路复用在Linux下有``select``,``poll``,``epoll``三种系统调用，�
 
 ##### select
 
-TBD.
+在Linux命令行下输入`man 2 select`可以看到Linux文档对``select`的描述:
+```cpp
+    #include <sys/select.h>
+
+    int select(int nfds, fd_set *readfds, fd_set *writefds,
+                fd_set *exceptfds, struct timeval *timeout);
+    /*
+    select()  allows  a  program  to  monitor  multiple  file descriptors, waiting until one or more of the file descriptors become
+    "ready" for some class of I/O operation (e.g., input possible).  A file descriptor is considered ready if  it  is  possible  to
+    perform a corresponding I/O operation (e.g., read(2), or a sufficiently small write(2)) without blocking.
+
+    select() can monitor only file descriptors numbers that are less than FD_SETSIZE; poll(2) and epoll(7) do not have this limita‐
+    tion.  See BUGS.
+
+    */
+```
+``select``可以让一个程序监视多个文件描述符以等待I/O就绪，并且``select``存在一个名为``FD_SETSIZE``的监视上限，继续通过翻阅文档可以看到其参数含义:
+- ``nfds`` 表示希望监视的文件描述符中最大的文件描述符数字加一
+- ``readfds`` 表示希望监视读就绪的文件描述符
+- ``writefds`` 表示希望监视写就绪的文件描述符
+- ``exceptfds`` 表示希望监视异常发生的文件描述符
+- ``timeout`` 表示阻塞的超时事件，超时立即返回
+###### 文件描述符
+对于文件描述符集合，文档是这样解释的:
+```
+ File descriptor sets
+    The principal arguments of select() are three "sets" of file descriptors (declared with  the  type  fd_set),  which  allow  the
+    caller to wait for three classes of events on the specified set of file descriptors.  Each of the fd_set arguments may be spec‐
+    ified as NULL if no file descriptors are to be watched for the corresponding class of events.
+
+    Note well: Upon return, each of the file descriptor sets is modified in place to indicate which file descriptors are  currently
+    "ready".   Thus,  if  using select() within a loop, the sets must be reinitialized before each call.  The implementation of the
+    fd_set arguments as value-result arguments is a design error that is avoided in poll(2) and epoll(7).
+```
+其说明若不需要对某类事件进行监听，则将该事件文件描述符参数设置为``NULL``；同时，当``select``检测返回时，会将已就绪的事件进行修改，如果需要重复监听某文件描述符，则需要在处理完其事件后重新加入回集合。
+
+```cpp
+#undef __FD_SETSIZE
+#define __FD_SETSIZE	1024
+
+typedef struct {
+	unsigned long fds_bits[__FD_SETSIZE / (8 * sizeof(long))];
+} __kernel_fd_set;
+```
+在Linux中，``fd set``主要以一个``unsigned long``数组进行位存储，每一个加入到集合中的文件描述符作为一个位进行监视，如某位被置为了1，则说明该位所表示的文件描述符正在被监视，而当被监视的文件就绪后，函数传入的``fd_set``会被修改，只有就绪的文件描述符会被置为1(此过程较为复杂，处理时会利用一个六位图组成结构体记录就绪文件，然后再将就绪文件拷贝回传入的``fd_set``)，此时若需要重复监视，则应重置``fd_set``。
+
+所以文件描述符集合有如下操作:
+```cpp
+void FD_CLR(int fd, fd_set *set); //从集合中删除文件描述符
+int  FD_ISSET(int fd, fd_set *set); //判断文件描述符是否就绪
+void FD_SET(int fd, fd_set *set); //将文件描述符加入到集合
+void FD_ZERO(fd_set *set); //清空集合
+```
+
+###### 超时时间
+超时时间是一个``timeval``结构体指针，当其设置为NULL时表示阻塞，等待有文件就绪后才返回。
+```cpp
+struct timeval{
+    long tv_sec; //秒
+    long tv_usec; //微秒
+};
+```
+
+###### 使用示例
+使用``select``进行服务器的多连接实现。
+
+```CPP
+#include "sys/socket.h"
+#include "arpa/inet.h"
+#include "unistd.h"
+#include "cstring"
+#include "stdio.h"
+#include "stdlib.h"
+#include "set"
+#include "sys/select.h"
+#define BUFFER_MAX 128
+
+/* 判断是否出错 */
+void iferror(bool check,const char* error_msg){
+    if(check){
+        perror(error_msg);
+        exit(0);
+    }
+}
+
+/* argv[]存放服务器ip port*/
+int main(int args,char* argv[]){
+    int servfd = socket(AF_INET,SOCK_STREAM,0);
+
+    if(args <= 2){
+        perror("lack args");
+        return 0;
+    }
+    int opt=1;
+    if (setsockopt(servfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt failed");
+        close(servfd);
+        return 1;
+    }
+    struct sockaddr_in serv_addr;
+    memset(&serv_addr,0,sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = inet_addr(argv[1]);
+    serv_addr.sin_port = htons(atoi(argv[2]));
+    int ret=bind(servfd,(sockaddr*)&serv_addr,sizeof(serv_addr));
+    iferror(ret < 0,"bind fail");
+    ret=listen(servfd,SOMAXCONN);
+    iferror(ret < 0,"listen fail");
+    /* 上面和基本的C/S模型一致 */
+
+    /* 创建读就绪文件描述符集合 */
+    fd_set readfds;
+    /* 创建文件描述符集合(便于找最大值以及初始化) */
+    std::set<int> fds;
+    fds.insert(servfd);
+    int fd_max=servfd;    
+    while(true){
+        /* 初始化readfds */
+        FD_ZERO(&readfds);
+        /* 设置需要监听的文件描述符 */
+        for(auto &fd:fds){
+            FD_SET(fd,&readfds);
+        }
+        /* 获取就绪的文件描述符 */
+        int ret = select(fd_max+1,&readfds,NULL,NULL,NULL);
+        iferror(ret<=0,"select fail");
+        for(auto &fd:fds){
+            /* 对服务器socket的读就绪，即有连接来临 */
+            if(FD_ISSET(fd,&readfds) && fd == servfd){
+                struct sockaddr_in clnt_addr;
+                memset(&clnt_addr,0,sizeof(clnt_addr));
+                socklen_t clnt_addr_len = sizeof(clnt_addr);
+                int clntfd = accept(servfd,(sockaddr*)&clnt_addr,&clnt_addr_len);
+                iferror(ret < 0,"accpet fail");
+                FD_SET(clntfd,&readfds);
+                fds.insert(clntfd);
+                fd_max = *(--fds.end());
+            }
+            /* 对于客户端socket的读就绪，即有信息来临 */
+            else if(FD_ISSET(fd,&readfds)){
+                char buffer[BUFFER_MAX];
+                memset(buffer,0,sizeof(buffer));
+                ret = read(fd,buffer,BUFFER_MAX);
+                if(ret <= 0){
+                    perror("out of connection");
+                    FD_CLR(fd,&readfds);
+                    fds.erase(fd);
+                    close(fd);
+                    continue;
+                }
+                ret = write(fd,buffer,BUFFER_MAX);
+                iferror(ret<=0,"write fail");
+            }
+        }        
+
+    }
+    close(servfd);
+}
+```
